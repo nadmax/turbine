@@ -28,7 +28,7 @@ impl SecurityManager {
         self.validate_volumes(&container.config.volumes)?;
         self.validate_resource_limits(&container.config.resources)?;
         self.validate_network_security(container)?;
-        
+
         Ok(())
     }
 
@@ -52,14 +52,14 @@ impl SecurityManager {
                 ));
             }
         }
-        
+
         Ok(())
     }
 
     fn validate_volumes(&self, volumes: &[crate::VolumeMount]) -> Result<()> {
         for volume in volumes {
             let host_path_str = volume.host_path.to_string_lossy();
-            
+
             for restricted in &self.restricted_paths {
                 if host_path_str.starts_with(restricted) {
                     return Err(TurbineError::SecurityError(
@@ -76,7 +76,7 @@ impl SecurityManager {
 
             self.validate_path_permissions(&volume.host_path)?;
         }
-        
+
         Ok(())
     }
 
@@ -104,7 +104,7 @@ impl SecurityManager {
                 ));
             }
         }
-        
+
         Ok(())
     }
 
@@ -122,14 +122,14 @@ impl SecurityManager {
                 ));
             }
         }
-        
+
         Ok(())
     }
 
     fn is_system_path(&self, path: &Path) -> bool {
         let system_paths = ["/etc", "/usr", "/lib", "/bin", "/sbin", "/boot"];
         let path_str = path.to_string_lossy();
-        
+
         system_paths.iter().any(|&sys_path| path_str.starts_with(sys_path))
     }
 
@@ -144,7 +144,7 @@ impl SecurityManager {
                 format!("Path {:?} is world-writable, which is not allowed", path)
             ));
         }
-        
+
         Ok(())
     }
 
@@ -165,7 +165,7 @@ impl SecurityManager {
             setrlimit(Resource::RLIMIT_FSIZE, disk_bytes, disk_bytes)
                 .map_err(|e| TurbineError::SecurityError(format!("Failed to set disk limit: {}", e)))?;
         }
-        
+
         Ok(())
     }
 
@@ -174,15 +174,15 @@ impl SecurityManager {
             let user = get_user_by_name(username)
                 .ok_or_else(|| TurbineError::SecurityError(format!("User '{}' not found", username)))?;
 
-            nix::unistd::setuid(user.uid())
+            nix::unistd::setuid(user.uid().into())
                 .map_err(|e| TurbineError::SecurityError(format!("Failed to set UID: {}", e)))?;
 
             if let Some(group) = get_group_by_name(username) {
-                nix::unistd::setgid(group.gid())
+                nix::unistd::setgid(group.gid().into())
                     .map_err(|e| TurbineError::SecurityError(format!("Failed to set GID: {}", e)))?;
             }
         }
-        
+
         Ok(())
     }
 
@@ -190,19 +190,20 @@ impl SecurityManager {
         self.setup_container_user(container)?;
         self.apply_resource_limits(&container.config.resources)?;
         self.setup_secure_filesystem(container)?;
-        
+
         Ok(())
     }
 
     fn setup_secure_filesystem(&self, container: &Container) -> Result<()> {
         use std::fs;
-        
+
         let sensitive_dirs = ["proc", "sys", "dev"];
-        
+
         for dir in &sensitive_dirs {
             let path = container.root_path.join(dir);
             if path.exists() {
                 let permissions = fs::Permissions::from_mode(0o555);
+
                 fs::set_permissions(&path, permissions)?;
             }
         }
@@ -212,7 +213,7 @@ impl SecurityManager {
             let permissions = fs::Permissions::from_mode(0o1777);
             fs::set_permissions(&tmp_path, permissions)?;
         }
-        
+
         Ok(())
     }
 
@@ -228,13 +229,13 @@ impl SecurityManager {
                 "Image path must be absolute or relative to current directory".to_string()
             ));
         }
-        
+
         Ok(())
     }
 
     pub fn sanitize_environment(&self, env: &mut std::collections::HashMap<String, String>) -> Result<()> {
         let dangerous_vars = ["LD_PRELOAD", "LD_LIBRARY_PATH", "PATH"];
-        
+
         for var in &dangerous_vars {
             if let Some(value) = env.get(*var) {
                 if value.contains("..") || value.contains("/etc") || value.contains("/usr") {
@@ -245,7 +246,7 @@ impl SecurityManager {
 
         env.insert("TURBINE_CONTAINER".to_string(), "true".to_string());
         env.insert("HOME".to_string(), "/app".to_string());
-        
+
         Ok(())
     }
 }

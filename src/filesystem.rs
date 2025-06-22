@@ -14,24 +14,43 @@ impl FilesystemManager {
         }
     }
 
+    pub fn base_path(&self) -> &Path {
+        &self.base_path
+    }
+
+    pub fn resolve_path<P: AsRef<Path>>(&self, path: P) -> PathBuf {
+        let path = path.as_ref();
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.base_path.join(path)
+        }
+    }
+
     pub fn create_container_root(&self, container: &Container) -> Result<()> {
-        let root_path = &container.root_path;        
+        let root_path = if container.root_path.is_absolute() {
+            container.root_path.clone()
+        } else {
+            self.base_path.join(&container.root_path)
+        };
+
         if root_path.exists() {
             return Err(TurbineError::FilesystemError(
                 format!("Container root already exists: {:?}", root_path)
             ));
         }
 
-        fs::create_dir_all(root_path)?;
-        
+        fs::create_dir_all(&root_path)?;
+
         let subdirs = ["bin", "etc", "lib", "tmp", "var", "proc", "sys", "dev", "app"];
+
         for subdir in &subdirs {
             let path = root_path.join(subdir);
             fs::create_dir_all(&path)?;
         }
 
-        self.setup_basic_files(root_path)?;
-        
+        self.setup_basic_files(&root_path)?;
+
         Ok(())
     }
 
@@ -60,13 +79,13 @@ impl FilesystemManager {
                 self.bind_mount(&volume.host_path, &target_path, volume.readonly)?;
             }
         }
-        
+
         Ok(())
     }
 
     fn bind_mount(&self, source: &Path, target: &Path, readonly: bool) -> Result<()> {
         use std::process::Command;
-        
+
         let mut cmd = Command::new("mount");
         cmd.arg("--bind")
            .arg(source)
@@ -82,23 +101,23 @@ impl FilesystemManager {
                     source, target, String::from_utf8_lossy(&output.stderr))
             ));
         }
-        
+
         Ok(())
     }
 
     fn setup_basic_files(&self, root_path: &Path) -> Result<()> {
         let resolv_conf = root_path.join("etc/resolv.conf");
         fs::write(&resolv_conf, "nameserver 8.8.8.8\nnameserver 8.8.4.4\n")?;
-        
+
         let passwd = root_path.join("etc/passwd");
         fs::write(&passwd, "turbine:x:1000:1000:Turbine User:/app:/bin/sh\n")?;
-        
+
         let group = root_path.join("etc/group");
         fs::write(&group, "turbine:x:1000:\n")?;
-        
+
         let hosts = root_path.join("etc/hosts");
         fs::write(&hosts, "127.0.0.1 localhost\n::1 localhost\n")?;
-        
+
         Ok(())
     }
 
@@ -113,12 +132,12 @@ impl FilesystemManager {
 
     fn unmount_volumes(&self, container: &Container) -> Result<()> {
         use std::process::Command;
-        
+
         for volume in &container.config.volumes {
             let target_path = container.root_path.join(
                 volume.container_path.strip_prefix("/").unwrap_or(&volume.container_path)
             );
-            
+
             if target_path.exists() {
                 let output = Command::new("umount")
                     .arg(&target_path)
@@ -129,7 +148,7 @@ impl FilesystemManager {
                 }
             }
         }
-        
+
         Ok(())
     }
 
@@ -139,11 +158,12 @@ impl FilesystemManager {
                 working_dir.strip_prefix("/").unwrap_or(working_dir)
             );
             fs::create_dir_all(&work_path)?;
-            
+
             let permissions = fs::Permissions::from_mode(0o755);
+
             fs::set_permissions(&work_path, permissions)?;
         }
-        
+
         Ok(())
     }
 }

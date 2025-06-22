@@ -1,4 +1,4 @@
-use crate::{ContainerConfig, TurbineError, Result};
+use crate::{ContainerConfig, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -29,7 +29,7 @@ impl Container {
     pub fn new(config: ContainerConfig) -> Result<Self> {
         let id = Uuid::new_v4().to_string();
         let root_path = PathBuf::from(format!("/tmp/turbine/{}", id));
-        
+
         Ok(Container {
             id,
             config,
@@ -37,8 +37,8 @@ impl Container {
             pid: None,
             root_path,
             created_at: chrono::Utc::now(),
-            started_at: None,
-            stopped_at: None,
+           started_at: None,
+           stopped_at: None,
         })
     }
 
@@ -67,6 +67,23 @@ impl Container {
 
     pub fn set_pid(&mut self, pid: u32) {
         self.pid = Some(pid);
+    }
+
+    // Convenience methods for accessing user/group info
+    pub fn get_user(&self) -> Option<&String> {
+        self.config.user.as_ref()
+    }
+
+    pub fn get_uid(&self) -> Option<u32> {
+        self.config.uid
+    }
+
+    pub fn get_gid(&self) -> Option<u32> {
+        self.config.gid
+    }
+
+    pub fn get_groups(&self) -> Option<&Vec<u32>> {
+        self.config.groups.as_ref()
     }
 }
 
@@ -119,4 +136,3 @@ impl Default for ContainerRegistry {
         Self::new()
     }
 }
-

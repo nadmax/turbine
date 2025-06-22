@@ -304,6 +304,7 @@ impl TurbineRuntime {
         drop(process);
 
         let containers = self.list_containers().await?;
+
         for container in containers {
             if container.is_running() {
                 self.remove_container(&container.id, true).await?;
