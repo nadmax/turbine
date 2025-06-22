@@ -14,6 +14,9 @@ pub struct ContainerConfig {
     pub resources: ResourceLimits,
     pub network: NetworkConfig,
     pub user: Option<String>,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    pub groups: Option<Vec<u32>>,
     pub restart_policy: RestartPolicy,
 }
 
@@ -67,6 +70,9 @@ impl Default for ContainerConfig {
             resources: ResourceLimits::default(),
             network: NetworkConfig::default(),
             user: None,
+            uid: None,
+            gid: None,
+            groups: None,
             restart_policy: RestartPolicy::Never,
         }
     }
@@ -130,6 +136,12 @@ impl ContainerConfig {
             }
         }
 
+        if let Some(uid) = self.uid {
+            if uid == 0 && self.user.as_ref().map_or(false, |u| u != "root") {
+                return Err(anyhow::anyhow!("UID 0 should only be used with user 'root'"));
+            }
+        }
+
         Ok(())
     }
 
@@ -141,15 +153,44 @@ impl ContainerConfig {
         });
 
         self.environment.insert("PORT".to_string(), "8080".to_string());
-        self.environment.insert("NODE_ENV".to_string(), "production".to_string());        
+        self.environment.insert("NODE_ENV".to_string(), "production".to_string());
         self.restart_policy = RestartPolicy::Always;
         if self.resources.memory_mb.is_none() {
             self.resources.memory_mb = Some(256);
         }
-        
+
         if self.resources.cpu_quota.is_none() {
             self.resources.cpu_quota = Some(0.5);
         }
     }
-}
 
+    pub fn set_user(&mut self, user: String, uid: Option<u32>, gid: Option<u32>) {
+        self.user = Some(user);
+        self.uid = uid;
+        self.gid = gid;
+    }
+
+    pub fn set_root_user(&mut self) {
+        self.user = Some("root".to_string());
+        self.uid = Some(0);
+        self.gid = Some(0);
+        self.groups = None;
+    }
+
+    pub fn set_nobody_user(&mut self) {
+        self.user = Some("nobody".to_string());
+        self.uid = Some(65534);
+        self.gid = Some(65534);
+        self.groups = None;
+    }
+
+    pub fn add_groups(&mut self, groups: Vec<u32>) {
+        if let Some(existing) = &mut self.groups {
+            existing.extend(groups);
+            existing.sort_unstable();
+            existing.dedup();
+        } else {
+            self.groups = Some(groups);
+        }
+    }
+}
