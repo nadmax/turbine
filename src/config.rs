@@ -105,6 +105,7 @@ impl ContainerConfig {
         let content = serde_json::to_string_pretty(self)?;
 
         std::fs::write(path, content)?;
+
         Ok(())
     }
 
