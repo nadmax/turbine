@@ -102,13 +102,13 @@ impl Default for NetworkConfig {
 impl ContainerConfig {
     pub fn from_file(path: &str) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
-        let config: ContainerConfig = serde_json::from_str(&content)?;
+        let config: ContainerConfig = toml::from_str(&content)?;
 
         Ok(config)
     }
 
     pub fn to_file(&self, path: &str) -> anyhow::Result<()> {
-        let content = serde_json::to_string_pretty(self)?;
+        let content = toml::to_string_pretty(self)?;
 
         std::fs::write(path, content)?;
 

@@ -10,7 +10,8 @@ pub enum TurbineError {
     SecurityError(String),
     RuntimeError(String),
     IoError(std::io::Error),
-    SerdeError(serde_json::Error),
+    SerdeError(toml::de::Error),
+    SerdeSerError(toml::ser::Error),
 }
 
 impl fmt::Display for TurbineError {
@@ -24,7 +25,8 @@ impl fmt::Display for TurbineError {
             TurbineError::SecurityError(msg) => write!(f, "Security error: {}", msg),
             TurbineError::RuntimeError(msg) => write!(f, "Runtime error: {}", msg),
             TurbineError::IoError(err) => write!(f, "IO error: {}", err),
-            TurbineError::SerdeError(err) => write!(f, "Serialization error: {}", err),
+            TurbineError::SerdeError(err) => write!(f, "TOML deserialization error: {}", err),
+            TurbineError::SerdeSerError(err) => write!(f, "TOML serialization error: {}", err),
         }
     }
 }
@@ -37,9 +39,15 @@ impl From<std::io::Error> for TurbineError {
     }
 }
 
-impl From<serde_json::Error> for TurbineError {
-    fn from(err: serde_json::Error) -> Self {
+impl From<toml::de::Error> for TurbineError {
+    fn from(err: toml::de::Error) -> Self {
         TurbineError::SerdeError(err)
+    }
+}
+
+impl From<toml::ser::Error> for TurbineError {
+    fn from(err: toml::ser::Error) -> Self {
+        TurbineError::SerdeSerError(err)
     }
 }
 
