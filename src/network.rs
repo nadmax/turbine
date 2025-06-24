@@ -1,7 +1,8 @@
-use crate::{Container, TurbineError, Result};
+use crate::{Container, TurbineError, Result, PortMapping};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::process::Command;
+use std::fs;
 
 #[derive(Debug, Clone)]
 pub enum NetworkConfig {
@@ -18,7 +19,7 @@ pub enum NetworkConfig {
 impl Default for NetworkConfig {
     fn default() -> Self {
         NetworkConfig::IPv4 {
-            subnet: Ipv4Addr::new(172, 17, 0, 0),
+            subnet: Ipv4Addr::new(10, 88, 0, 0),
             prefix: 24,
         }
     }
@@ -29,6 +30,9 @@ pub struct NetworkManager {
     network_config: NetworkConfig,
     allocated_ips: HashMap<String, Vec<IpAddr>>,
     port_mappings: HashMap<u16, String>,
+    container_ports: HashMap<String, Vec<PortMapping>>,
+    netns_dir: String,
+    use_slirp4netns: bool,
 }
 
 impl NetworkManager {
@@ -38,6 +42,9 @@ impl NetworkManager {
             network_config: NetworkConfig::default(),
             allocated_ips: HashMap::new(),
             port_mappings: HashMap::new(),
+            container_ports: HashMap::new(),
+            netns_dir: "/tmp/turbine-netns".to_string(),
+            use_slirp4netns: Self::check_slirp4netns_available(),
         }
     }
 
@@ -47,102 +54,129 @@ impl NetworkManager {
             network_config: config,
             allocated_ips: HashMap::new(),
             port_mappings: HashMap::new(),
+            container_ports: HashMap::new(),
+            netns_dir: "/tmp/turbine-netns".to_string(),
+            use_slirp4netns: Self::check_slirp4netns_available(),
         }
     }
 
-    pub fn setup_bridge(&self) -> Result<()> {
-        if !self.bridge_exists()? {
-            self.create_bridge()?;
-            self.configure_bridge()?;
+    fn check_slirp4netns_available() -> bool {
+        Command::new("which")
+        .arg("slirp4netns")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+    }
+
+    pub fn setup_rootless_networking(&self) -> Result<()> {
+        fs::create_dir_all(&self.netns_dir)?;
+
+        if self.use_slirp4netns {
+            println!("Using slirp4netns for rootless networking");
+            Ok(())
+        } else {
+            self.setup_user_namespace_networking()
+        }
+    }
+
+    fn setup_user_namespace_networking(&self) -> Result<()> {
+        if !self.check_user_namespace_support()? {
+            return Err(TurbineError::NetworkError(
+                "User namespaces not supported. Consider installing slirp4netns for rootless networking.".to_string()
+            ));
+        }
+
+        let netns_path = format!("{}/{}", self.netns_dir, self.bridge_name);
+        let output = Command::new("unshare")
+        .args(&["--net", "--mount-proc", "/bin/sh", "-c", &format!("mount --bind /proc/self/ns/net {}", netns_path)])
+        .output()?;
+        if !output.status.success() {
+            return Err(TurbineError::NetworkError(
+                format!("Failed to create network namespace: {}", String::from_utf8_lossy(&output.stderr))
+            ));
+        }
+
+        self.setup_namespaced_bridge(&netns_path)?;
+
+        Ok(())
+    }
+
+    fn check_user_namespace_support(&self) -> Result<bool> {
+        match fs::read_to_string("/proc/sys/user/max_user_namespaces") {
+            Ok(content) => {
+                let max_ns: i32 = content.trim().parse().unwrap_or(0);
+                Ok(max_ns > 0)
+            }
+            Err(_) => Ok(false)
+        }
+    }
+
+    fn setup_namespaced_bridge(&self, netns_path: &str) -> Result<()> {
+        let setup_script = format!(r#"
+        # Create bridge
+        ip link add name {} type bridge
+        ip link set dev {} up
+
+        # Configure bridge IP
+        {}
+
+        # Setup loopback
+        ip link set dev lo up
+        "#,
+        self.bridge_name,
+        self.bridge_name,
+        self.get_bridge_ip_command()
+        );
+
+        let output = Command::new("nsenter")
+        .args(&[&format!("--net={}", netns_path), "/bin/sh", "-c", &setup_script])
+        .output()?;
+        if !output.status.success() {
+            return Err(TurbineError::NetworkError(
+                format!("Failed to setup namespaced bridge: {}", String::from_utf8_lossy(&output.stderr))
+            ));
         }
 
         Ok(())
     }
 
-    fn bridge_exists(&self) -> Result<bool> {
-        let output = Command::new("ip")
-            .args(&["link", "show", &self.bridge_name])
-            .output()?;
-
-        Ok(output.status.success())
-    }
-
-    fn create_bridge(&self) -> Result<()> {
-        let output = Command::new("ip")
-            .args(&["link", "add", "name", &self.bridge_name, "type", "bridge"])
-            .output()?;
-        if !output.status.success() {
-            return Err(TurbineError::NetworkError(
-                format!("Failed to create bridge: {}", String::from_utf8_lossy(&output.stderr))
-            ));
-        }
-
-        let output = Command::new("ip")
-            .args(&["link", "set", "dev", &self.bridge_name, "up"])
-            .output()?;
-        if !output.status.success() {
-            return Err(TurbineError::NetworkError(
-                format!("Failed to bring up bridge: {}", String::from_utf8_lossy(&output.stderr))
-            ));
-        }
-
-        Ok(())
-    }
-
-    fn configure_bridge(&self) -> Result<()> {
+    fn get_bridge_ip_command(&self) -> String {
         match &self.network_config {
             NetworkConfig::IPv4 { subnet, prefix } => {
                 let octets = subnet.octets();
-                let bridge_ip = format!("{}.{}.{}.1/{}", octets[0], octets[1], octets[2], prefix);
-                self.add_bridge_address(&bridge_ip)?;
+                format!("ip addr add {}.{}.{}.1/{} dev {}",
+                    octets[0], octets[1], octets[2], prefix, self.bridge_name)
             }
             NetworkConfig::IPv6 { subnet, prefix } => {
                 let segments = subnet.segments();
-                let bridge_ip = format!("{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:1/{}",
-                                        segments[0], segments[1], segments[2], segments[3],
-                                        segments[4], segments[5], segments[6], prefix);
-                self.add_bridge_address(&bridge_ip)?;
+                format!("ip addr add {:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:1/{} dev {}",
+                    segments[0], segments[1], segments[2], segments[3],
+                    segments[4], segments[5], segments[6], prefix, self.bridge_name)
             }
             NetworkConfig::DualStack { ipv4_subnet, ipv4_prefix, ipv6_subnet, ipv6_prefix } => {
                 let octets = ipv4_subnet.octets();
-                let ipv4_bridge_ip = format!("{}.{}.{}.1/{}", octets[0], octets[1], octets[2], ipv4_prefix);
-                self.add_bridge_address(&ipv4_bridge_ip)?;
-
                 let segments = ipv6_subnet.segments();
-                let ipv6_bridge_ip = format!("{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:1/{}",
-                                             segments[0], segments[1], segments[2], segments[3],
-                                             segments[4], segments[5], segments[6], ipv6_prefix);
-                self.add_bridge_address(&ipv6_bridge_ip)?;
+                format!("ip addr add {}.{}.{}.1/{} dev {} && ip addr add {:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:1/{} dev {}",
+                    octets[0], octets[1], octets[2], ipv4_prefix, self.bridge_name,
+                    segments[0], segments[1], segments[2], segments[3],
+                    segments[4], segments[5], segments[6], ipv6_prefix, self.bridge_name)
             }
         }
-
-        Ok(())
-    }
-
-    fn add_bridge_address(&self, ip_with_prefix: &str) -> Result<()> {
-        let output = Command::new("ip")
-            .args(&["addr", "add", ip_with_prefix, "dev", &self.bridge_name])
-            .output()?;
-        if !output.status.success() {
-            return Err(TurbineError::NetworkError(
-                format!("Failed to configure bridge IP {}: {}",
-                    ip_with_prefix, String::from_utf8_lossy(&output.stderr))
-            ));
-        }
-        Ok(())
     }
 
     pub fn setup_container_network(&mut self, container: &Container) -> Result<()> {
-        let container_ips = self.allocate_ips(&container.id)?;
-        let veth_host = format!("veth-{}", &container.id[..8]);
-        let veth_container = format!("veth-c-{}", &container.id[..8]);
+        self.container_ports.insert(container.id.clone(), container.config.ports.clone());
 
-        self.create_veth_pair(&veth_host, &veth_container)?;
-        self.attach_to_bridge(&veth_host)?;
-
-        for ip in &container_ips {
-            self.configure_container_interface(&veth_container, *ip)?;
+        if self.use_slirp4netns {
+            self.setup_slirp4netns_network(container)
+        } else {
+            self.setup_user_namespace_network(container)
         }
+    }
+
+    fn setup_slirp4netns_network(&mut self, container: &Container) -> Result<()> {
+        let _container_ips = self.allocate_ips(&container.id)?;
+        let mut port_args = Vec::new();
 
         for port in &container.config.ports {
             if self.port_mappings.contains_key(&port.host_port) {
@@ -151,16 +185,111 @@ impl NetworkManager {
                 ));
             }
 
-            let target_ip = container_ips.iter()
-                .find(|ip| ip.is_ipv4())
-                .or_else(|| container_ips.first())
-                .ok_or_else(|| TurbineError::NetworkError("No IP allocated for container".to_string()))?;
-
-            self.setup_port_forwarding(port.host_port, *target_ip, port.container_port)?;
+            port_args.push(format!("--configure"));
+            port_args.push(format!("tcp:{}-tcp:{}", port.host_port, port.container_port));
             self.port_mappings.insert(port.host_port, container.id.clone());
         }
 
+        println!("Container {} will use slirp4netns with ports: {:?}",
+                 &container.id[..8], container.config.ports);
+
         Ok(())
+    }
+
+    fn setup_user_namespace_network(&mut self, container: &Container) -> Result<()> {
+        let container_ips = self.allocate_ips(&container.id)?;
+        let veth_host = format!("veth-{}", &container.id[..8]);
+        let veth_container = format!("veth-c-{}", &container.id[..8]);
+        let netns_path = format!("{}/{}", self.netns_dir, self.bridge_name);
+        let create_veth_script = format!(r#"
+        ip link add {} type veth peer name {}
+        ip link set {} master {}
+        ip link set {} up
+        ip link set {} up
+        "#, veth_host, veth_container, veth_host, self.bridge_name, veth_host, self.bridge_name);
+        let output = Command::new("nsenter")
+        .args(&[&format!("--net={}", netns_path), "/bin/sh", "-c", &create_veth_script])
+        .output()?;
+        if !output.status.success() {
+            return Err(TurbineError::NetworkError(
+                format!("Failed to create veth pair in namespace: {}", String::from_utf8_lossy(&output.stderr))
+            ));
+        }
+
+        for ip in &container_ips {
+            self.configure_container_interface_in_namespace(&netns_path, &veth_container, *ip)?;
+        }
+
+        Ok(())
+    }
+
+    fn configure_container_interface_in_namespace(&self, netns_path: &str, interface: &str, ip: IpAddr) -> Result<()> {
+        let (ip_with_mask, family) = match ip {
+            IpAddr::V4(ipv4) => {
+                let prefix = match &self.network_config {
+                    NetworkConfig::IPv4 { prefix, .. } => prefix,
+                    NetworkConfig::DualStack { ipv4_prefix, .. } => ipv4_prefix,
+                    _ => &24u8,
+                };
+                (format!("{}/{}", ipv4, prefix), "-4")
+            }
+            IpAddr::V6(ipv6) => {
+                let prefix = match &self.network_config {
+                    NetworkConfig::IPv6 { prefix, .. } => prefix,
+                    NetworkConfig::DualStack { ipv6_prefix, .. } => ipv6_prefix,
+                    _ => &64u8,
+                };
+                (format!("{}/{}", ipv6, prefix), "-6")
+            }
+        };
+
+        let output = Command::new("nsenter")
+        .args(&[
+            &format!("--net={}", netns_path),
+              "ip", family, "addr", "add", &ip_with_mask, "dev", interface
+        ])
+        .output()?;
+        if !output.status.success() {
+            return Err(TurbineError::NetworkError(
+                format!("Failed to configure container interface: {}", String::from_utf8_lossy(&output.stderr))
+            ));
+        }
+
+        Ok(())
+    }
+
+    pub fn start_slirp4netns(&self, container_pid: u32, container_id: &str) -> Result<std::process::Child> {
+        if !self.use_slirp4netns {
+            return Err(TurbineError::NetworkError(
+                "slirp4netns not available".to_string()
+            ));
+        }
+
+        let mut cmd = Command::new("slirp4netns");
+        cmd.args(&[
+            "--configure",
+            "--mtu=65520",
+            "--disable-host-loopback",
+            &container_pid.to_string(),
+                 "tap0"
+        ]);
+
+        if let Some(ports) = self.get_container_ports(container_id) {
+            for port in ports {
+                cmd.args(&[
+                    "--port-forward",
+                    &format!("tcp:{}-tcp:{}", port.host_port, port.container_port)
+                ]);
+            }
+        }
+
+        let child = cmd.spawn()?;
+
+        Ok(child)
+    }
+
+    fn get_container_ports(&self, container_id: &str) -> Option<&Vec<PortMapping>> {
+        self.container_ports.get(container_id)
     }
 
     fn allocate_ips(&mut self, container_id: &str) -> Result<Vec<IpAddr>> {
@@ -173,18 +302,15 @@ impl NetworkManager {
         match &self.network_config {
             NetworkConfig::IPv4 { subnet, .. } => {
                 let ipv4 = self.allocate_ipv4(container_id, *subnet)?;
-
                 ips.push(IpAddr::V4(ipv4));
             }
             NetworkConfig::IPv6 { subnet, .. } => {
                 let ipv6 = self.allocate_ipv6(container_id, *subnet)?;
-
                 ips.push(IpAddr::V6(ipv6));
             }
             NetworkConfig::DualStack { ipv4_subnet, ipv6_subnet, .. } => {
                 let ipv4 = self.allocate_ipv4(container_id, *ipv4_subnet)?;
                 let ipv6 = self.allocate_ipv6(container_id, *ipv6_subnet)?;
-
                 ips.push(IpAddr::V4(ipv4));
                 ips.push(IpAddr::V6(ipv6));
             }
@@ -198,7 +324,7 @@ impl NetworkManager {
         if let Some(existing_ips) = self.allocated_ips.get(container_id) {
             if let Some(ipv4) = existing_ips.iter().find_map(|ip| match ip {
                 IpAddr::V4(v4) => Some(*v4),
-                                                             _ => None,
+                _ => None,
             }) {
                 return Ok(ipv4);
             }
@@ -256,153 +382,28 @@ impl NetworkManager {
         }
     }
 
-    fn create_veth_pair(&self, host_name: &str, container_name: &str) -> Result<()> {
-        let output = Command::new("ip")
-            .args(&["link", "add", host_name, "type", "veth", "peer", "name", container_name])
-            .output()?;
-        if !output.status.success() {
-            return Err(TurbineError::NetworkError(
-                format!("Failed to create veth pair: {}", String::from_utf8_lossy(&output.stderr))
-            ));
-        }
-
-        Ok(())
-    }
-
-    fn attach_to_bridge(&self, interface: &str) -> Result<()> {
-        let output = Command::new("ip")
-            .args(&["link", "set", interface, "master", &self.bridge_name])
-            .output()?;
-        if !output.status.success() {
-            return Err(TurbineError::NetworkError(
-                format!("Failed to attach to bridge: {}", String::from_utf8_lossy(&output.stderr))
-            ));
-        }
-
-        let output = Command::new("ip")
-            .args(&["link", "set", "dev", interface, "up"])
-            .output()?;
-        if !output.status.success() {
-            return Err(TurbineError::NetworkError(
-                format!("Failed to bring up interface: {}", String::from_utf8_lossy(&output.stderr))
-            ));
-        }
-
-        Ok(())
-    }
-
-    fn configure_container_interface(&self, interface: &str, ip: IpAddr) -> Result<()> {
-        let (ip_with_mask, family) = match ip {
-            IpAddr::V4(ipv4) => {
-                let prefix = match &self.network_config {
-                    NetworkConfig::IPv4 { prefix, .. } => prefix,
-                    NetworkConfig::DualStack { ipv4_prefix, .. } => ipv4_prefix,
-                    _ => &24u8,
-                };
-                (format!("{}/{}", ipv4, prefix), "-4")
-            }
-            IpAddr::V6(ipv6) => {
-                let prefix = match &self.network_config {
-                    NetworkConfig::IPv6 { prefix, .. } => prefix,
-                    NetworkConfig::DualStack { ipv6_prefix, .. } => ipv6_prefix,
-                    _ => &64u8,
-                };
-                (format!("{}/{}", ipv6, prefix), "-6")
-            }
-        };
-
-        let output = Command::new("ip")
-            .args(&[family, "addr", "add", &ip_with_mask, "dev", interface])
-            .output()?;
-        if !output.status.success() {
-            return Err(TurbineError::NetworkError(
-                format!("Failed to configure container interface: {}", String::from_utf8_lossy(&output.stderr))
-            ));
-        }
-
-        Ok(())
-    }
-
-    fn setup_port_forwarding(&self, host_port: u16, container_ip: IpAddr, container_port: u16) -> Result<()> {
-        let (iptables_cmd, rule) = match container_ip {
-            IpAddr::V4(ipv4) => (
-                "iptables",
-                format!("DNAT --to-destination {}:{}", ipv4, container_port)
-            ),
-            IpAddr::V6(ipv6) => (
-                "ip6tables",
-                format!("DNAT --to-destination [{}]:{}", ipv6, container_port)
-            ),
-        };
-
-        let output = Command::new(iptables_cmd)
-            .args(&[
-                "-t", "nat",
-                "-A", "PREROUTING",
-                "-p", "tcp",
-                "--dport", &host_port.to_string(),
-                "-j", &rule
-            ])
-            .output()?;
-        if !output.status.success() {
-            return Err(TurbineError::NetworkError(
-                format!("Failed to setup port forwarding: {}", String::from_utf8_lossy(&output.stderr))
-            ));
-        }
-
-        Ok(())
-    }
-
     pub fn cleanup_container_network(&mut self, container: &Container) -> Result<()> {
-        let veth_host = format!("veth-{}", &container.id[..8]);
-        let _ = Command::new("ip")
-            .args(&["link", "del", &veth_host])
-            .output();
+        if self.use_slirp4netns {
+            self.port_mappings.retain(|_, id| id != &container.id);
+        } else {
+            let veth_host = format!("veth-{}", &container.id[..8]);
+            let netns_path = format!("{}/{}", self.netns_dir, self.bridge_name);
 
-        for port in &container.config.ports {
-            self.cleanup_port_forwarding(port.host_port)?;
-            self.port_mappings.remove(&port.host_port);
+            let _ = Command::new("nsenter")
+            .args(&[&format!("--net={}", netns_path), "ip", "link", "del", &veth_host])
+            .output();
         }
 
         self.allocated_ips.remove(&container.id);
-
+        self.container_ports.remove(&container.id);
         Ok(())
     }
 
-    fn cleanup_port_forwarding(&self, host_port: u16) -> Result<()> {
-        for (cmd, family) in [("iptables", "IPv4"), ("ip6tables", "IPv6")] {
-            let output = Command::new(cmd)
-                .args(&[
-                    "-t", "nat",
-                    "-D", "PREROUTING",
-                    "-p", "tcp",
-                    "--dport", &host_port.to_string(),
-                    "-j", "DNAT"
-                ])
-                .output()?;
-            if !output.status.success() {
-                eprintln!(
-                    "Warning: Failed to cleanup {} port forwarding for port {}: {}",
-                    family, host_port, String::from_utf8_lossy(&output.stderr)
-                );
-            }
+    pub fn cleanup_networking(&self) -> Result<()> {
+        if !self.use_slirp4netns {
+            let netns_path = format!("{}/{}", self.netns_dir, self.bridge_name);
+            let _ = fs::remove_file(netns_path);
         }
-
-        Ok(())
-    }
-
-    pub fn cleanup_bridge(&self) -> Result<()> {
-        if self.bridge_exists()? {
-            let output = Command::new("ip")
-                .args(&["link", "del", &self.bridge_name])
-                .output()?;
-            if !output.status.success() {
-                return Err(TurbineError::NetworkError(
-                    format!("Failed to cleanup bridge: {}", String::from_utf8_lossy(&output.stderr))
-                ));
-            }
-        }
-
         Ok(())
     }
 
@@ -412,5 +413,31 @@ impl NetworkManager {
 
     pub fn network_config(&self) -> &NetworkConfig {
         &self.network_config
+    }
+
+    pub fn is_using_slirp4netns(&self) -> bool {
+        self.use_slirp4netns
+    }
+
+    pub fn setup_bridge(&self) -> Result<()> {
+        if self.use_slirp4netns {
+            println!("Using slirp4netns - no bridge setup required");
+            Ok(())
+        } else {
+            self.setup_rootless_networking()
+        }
+    }
+
+    pub fn cleanup_bridge(&self) -> Result<()> {
+        if !self.use_slirp4netns {
+            let netns_path = format!("{}/{}", self.netns_dir, self.bridge_name);
+            let cleanup_script = format!("ip link del {}", self.bridge_name);
+            let _ = Command::new("nsenter")
+            .args(&[&format!("--net={}", netns_path), "/bin/sh", "-c", &cleanup_script])
+            .output();
+
+            let _ = fs::remove_file(netns_path);
+        }
+        Ok(())
     }
 }

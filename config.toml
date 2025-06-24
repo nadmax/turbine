@@ -1,0 +1,45 @@
+name = "my-web-app"
+image = "nginx:latest"
+command = ["nginx", "-g", "daemon off;"]
+working_dir = "/usr/share/nginx/html"
+user = "turbine"
+uid = 101
+gid = 101
+groups = [101, 102]
+restart_policy = "Always"
+
+[environment]
+NODE_ENV = "production"
+PORT = "3000"
+DATABASE_URL = "postgres://localhost/mydb"
+
+[[ports]]
+host_port = 8080
+container_port = 80
+protocol = "tcp"
+
+[[ports]]
+host_port = 8443
+container_port = 443
+protocol = "tcp"
+
+[[volumes]]
+host_path = "/host/data"
+container_path = "/app/data"
+readonly = false
+
+[[volumes]]
+host_path = "/host/logs"
+container_path = "/app/logs"
+readonly = false
+
+[resources]
+memory_mb = 512
+cpu_quota = 1.0
+disk_mb = 2048
+max_processes = 256
+
+[network]
+bridge = "docker0"
+dns = ["8.8.8.8", "8.8.4.4", "1.1.1.1"]
+hostname = "my-container"
